@@ -3,4 +3,6 @@ peft
 datasets
 bitsandbytes
 accelerate
+torch
+torch-directml
 

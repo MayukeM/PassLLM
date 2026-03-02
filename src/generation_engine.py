@@ -248,13 +248,8 @@ def dynamic_beam_search(
             new_kv_cache = outputs.past_key_values
 
             for batch_idx, candidate in enumerate(batch_candidates):
-
-                # We subtract 1 from len() if the tokenizer adds a start token, 
-                # but usually just checking len() >= 8 is safe
-                is_long_enough = len(candidate['sequence']) >= getattr(Config, "MIN_PASSWORD_LENGTH", 4)
-
                 # If this specific candidate passes the Epsilon test, we save it as a "Finished Password"
-                if has_high_eos_prob[batch_idx] and is_long_enough:
+                if has_high_eos_prob[batch_idx]:
                     finished_candidate = candidate.copy()
                     finished_candidate['finished'] = True
                     finished_candidate['cache'] = None

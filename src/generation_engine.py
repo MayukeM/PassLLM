@@ -289,7 +289,9 @@ def dynamic_beam_search(
         valid_beams = []
         for b in new_beams:
             decoded_text = tokenizer.decode(b['sequence'], skip_special_tokens=True)
-            if len(decoded_text) <= max_depth:
+            min_len = getattr(Config, "MIN_PASSWORD_LENGTH", 8)
+            max_len = getattr(Config, "MAX_PASSWORD_LENGTH", 16)
+            if len(decoded_text) <= max_len and len(decoded_text) >= min_len:
                 valid_beams.append(b)
         new_beams = valid_beams
 

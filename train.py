@@ -13,16 +13,21 @@ from src.loader import build_model, inject_lora_layers
 from src.config import Config 
 
 '''
-Now that we have injected the new LoRA layers into the model in loader.py, we must tell PyTorch exactly what to update. 
-We want to freeze the massive 7B parameters and only train the tiny LoRA parameters, according to conventions described in the paper, which are currently just two small matrices per modified layer.
+训练脚本说明（新手向）：
+1) 先加载基础模型，并注入 LoRA 小模块；
+2) 冻结原模型参数，只训练 LoRA 参数；
+3) 准备数据，并且把“提示词部分”label 屏蔽（设为 -100，不计入损失）；
+4) 进行梯度累积训练，周期性保存 checkpoint；
+5) 最后仅保存 LoRA 权重，体积更小，部署更方便。
 '''
 
 def freeze_parameters(model):
     '''
-    We look through every single variable in the model. Billions.
-    If the parameter belongs to a LoRA layer (which we determine according to naming protocols), we want to train it.
-    Otherwise, if it does not belong to any LoRA layer - we will skip it.
-    It will be frozen for the training process, allowing us to save MASSIVE amounts of resources rather than training parameters for every single layer...
+    冻结参数函数：
+    - 名称中包含 lora_a / lora_b 的参数：保留可训练；
+    - 其余参数：全部冻结。
+
+    这样训练会非常省资源，因为只更新很小一部分参数。
     '''
     print("Freezing Base Model Parameters...")
     frozen_count = 0
@@ -39,9 +44,8 @@ def freeze_parameters(model):
 
 def print_trainable_parameters(model):
     ''' 
-    A minor "debug" function, giving us an idea of just how much parameters we're going to be training.
-    We'll sum the size of all parameters that require gradients, usually between 0.1% and 5% for certain models.
-    And we'll also sum the total numbers of parameters available by the model (7 billion for Mistral, 0.5 billion for Qwen).
+    打印可训练参数占比，帮助你确认：
+    “我们是不是只在训练 LoRA 小参数”。
     '''
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     all_params = sum(p.numel() for p in model.parameters())
@@ -54,8 +58,13 @@ def print_trainable_parameters(model):
 
 def format_and_mask(sample, tokenizer):
     '''
-    Optimizing the loss over the ENTIRE sequence would inevitably expose the model to many potential vulnerabilities.
-    We'll restrict the loss calculation only to the PASSWORD portion of the sequence. 
+    把单条样本转成模型输入，并做标签掩码（mask）：
+    - 输入文本 = 提示词 + 正确密码；
+    - labels 默认复制 input_ids；
+    - 但提示词部分的 labels 会改成 -100，表示“这里不参与损失计算”；
+    - padding 位置也设成 -100。
+
+    结果：模型主要学习“如何生成密码”，而不是重复提示词模板。
     '''
     full_text = Config.get_formatted_input(
         pii_dict=sample['pii'], 
@@ -93,6 +102,8 @@ def format_and_mask(sample, tokenizer):
     }
 
 def prepare_data(tokenizer):
+    # 读取 json 数据集，并对每条样本调用 format_and_mask。
+    # 最后返回 DataLoader，供训练循环按批次读取。
     print("Processing Data with Masking...")
 
     dataset = load_dataset("json", data_files=str(Config.RAW_DATA_FILE), split="train")
@@ -107,9 +118,11 @@ def prepare_data(tokenizer):
 
 def train_loop(model, tokenizer, dataloader):
     '''
-    The training loop established by the paper is pretty standard. 
-    We'll implement a warmup gradient for pure stabilization during the early processing steps, as per the paper.
-    And we're using an AdamW optimizer, although not specified by the paper.
+    训练主循环：
+    - 优化器：AdamW；
+    - 学习率调度：cosine + warmup；
+    - 梯度累积：用更小显存模拟更大 batch；
+    - 每个 epoch 结束保存 checkpoint。
     '''
     print("Starting Training Loop...")
     global_step = 0
@@ -138,13 +151,14 @@ def train_loop(model, tokenizer, dataloader):
 
         for step, batch in enumerate(progress_bar):
 
-            # Moving data back to the model's device
+            # 把当前 batch 放到模型所在设备（如 GPU）。
             input_ids = batch['input_ids'].to(model.device)
             mask = batch['attention_mask'].to(model.device)
             labels = batch['labels'].to(model.device)
 
             outputs = model(input_ids=input_ids, attention_mask=mask, labels=labels)
 
+            # 梯度累积核心：把 loss 除以累积步数，避免梯度量级变大。
             loss = outputs.loss / Config.GRAD_ACCUMULATION
             loss.backward()
 
@@ -154,6 +168,7 @@ def train_loop(model, tokenizer, dataloader):
                 optimizer.zero_grad()
                 global_step += 1
                 
+                # 如果配置了更高频 checkpoint，则在这里额外保存。
                 if checkpoint_every_steps > 0 and global_step % checkpoint_every_steps == 0:
                     save_checkpoint(model, optimizer, scheduler, epoch, global_step, current_loss)
 
@@ -169,11 +184,13 @@ def train_loop(model, tokenizer, dataloader):
     return model
 
 def save_checkpoint(model, optimizer, scheduler, epoch, global_step, loss):
+    # checkpoint 保存训练“中间状态”，支持断点续训。
     checkpoint_dir = Config.MODELS_DIR / "checkpoints"
     checkpoint_dir.mkdir(exist_ok=True)
     
     checkpoint_path = checkpoint_dir / f"checkpoint_epoch{epoch+1}_step{global_step}.pt"
     
+    # 只保存 LoRA 参数，减小文件体积。
     lora_state_dict = {k: v for k, v in model.state_dict().items() if "lora_" in k}
     
     checkpoint = {
@@ -188,6 +205,7 @@ def save_checkpoint(model, optimizer, scheduler, epoch, global_step, loss):
     torch.save(checkpoint, checkpoint_path)
     print(f"Checkpoint saved: {checkpoint_path.name}")
     
+    # 仅保留最近 3 个 checkpoint，避免磁盘被占满。
     checkpoints = sorted(checkpoint_dir.glob("checkpoint_*.pt"), key=lambda x: x.stat().st_mtime)
     for old_ckpt in checkpoints[:-3]:
         old_ckpt.unlink()
@@ -195,8 +213,9 @@ def save_checkpoint(model, optimizer, scheduler, epoch, global_step, loss):
 
 def save_model(model):
     '''
-    We don't want to save the whole massive model with billions of parameters again
-    We only want to save the parameters named "lora_..."
+    保存最终训练结果：
+    - 不保存基础大模型（太大）；
+    - 只保存 LoRA 参数（轻量）。
     '''
     print(f"Saving LoRA Weights to {Config.WEIGHTS_FILE}...")
     lora_state_dict = {k: v for k, v in model.state_dict().items() if "lora_" in k}
@@ -204,21 +223,21 @@ def save_model(model):
     print("Success!")
 
 if __name__ == "__main__":
-    # Build
+    # 1) 构建基础模型与 tokenizer
     model, tokenizer = build_model()
-    # Inject
+    # 2) 注入 LoRA 层
     model = inject_lora_layers(model)
-    # Freeze
+    # 3) 冻结非 LoRA 参数
     model = freeze_parameters(model)
-    # Enable gradient checkpointing A
+    # 4) 可选：开启 gradient checkpointing，进一步省显存
     if getattr(Config, 'USE_GRADIENT_CHECKPOINTING', False):
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         print("Gradient checkpointing enabled (saves VRAM)")
-    # Verify
+    # 5) 打印可训练参数占比，做 sanity check
     print_trainable_parameters(model)
-    # Prepare Data
+    # 6) 准备数据
     dataloader = prepare_data(tokenizer)
-    # Train
+    # 7) 开始训练
     model = train_loop(model, tokenizer, dataloader)
-    # Save
+    # 8) 保存 LoRA 权重
     save_model(model)
